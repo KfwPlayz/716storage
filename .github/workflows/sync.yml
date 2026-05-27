@@ -1,0 +1,58 @@
+name: Sync 716 Storage Overdue
+
+on:
+  schedule:
+    # Daily at 8:00 AM ET = 13:00 UTC (EDT) / 14:00 UTC (EST).
+    # Using 13:00 UTC so it always runs at 8 or 9 AM ET depending on DST.
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+    inputs:
+      debug_dump:
+        description: "Run in debug-dump mode (dumps HTML + screenshot, no Zapier calls)"
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        id: setup-chrome
+        with:
+          chrome-version: stable
+
+      - name: Install dependencies
+        run: npm install --omit=optional
+
+      - name: Run sync
+        env:
+          EMAIL: ${{ secrets.STORAGE_EMAIL }}
+          PASSWORD: ${{ secrets.STORAGE_PASSWORD }}
+          WEBHOOK_URL: ${{ secrets.ZAPIER_WEBHOOK_URL }}
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          DEBUG_DUMP: ${{ inputs.debug_dump == true && '1' || '' }}
+        run: node sync.js
+
+      - name: Upload debug artifacts on failure
+        if: failure() || inputs.debug_dump == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: |
+            debug_overdue_page.html
+            debug_overdue_page.png
+            failure*.png
+          if-no-files-found: ignore
+          retention-days: 7
