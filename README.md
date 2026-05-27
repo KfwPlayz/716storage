@@ -1,6 +1,6 @@
 # 716 Storage Overdue Sync
 
-Scrapes the **Collections Report** from `716selfstorage.storageunitsoftware.com/reports/collections` daily, and pushes each past-due renter to a Zapier webhook → GHL (location `WPHXIsSaU2aQpYy8rwzK`) with the `overdue_payment` tag.
+Scrapes the **Collections Report** from `716selfstorage.storageunitsoftware.com/reports/collections` daily, and pushes each past-due renter to a Zapier webhook → GHL with the `overdue_payment` tag.
 
 The GHL workflow uses a **timestamp staleness check** to auto-remove the tag from anyone who paid (they stop appearing in the scrape → their `last_seen_overdue` stamp goes stale → workflow exits them).
 
@@ -59,7 +59,6 @@ Build one Zap:
 - To test, you can either trigger one manual GitHub Actions run OR wait for the first scheduled run to populate sample data.
 
 **Step 2 — Action: GoHighLevel → Find or Create Contact**
-- Location: `WPHXIsSaU2aQpYy8rwzK`
 - Lookup by: **Phone** → map `lead.phone` (already E.164 formatted)
 - On create:
   - First Name → `lead.first_name`
@@ -83,7 +82,7 @@ Turn the Zap on.
 
 ---
 
-## 3. GHL setup (one-time, in location `WPHXIsSaU2aQpYy8rwzK`)
+## 3. GHL setup
 
 ### Custom fields (Settings → Custom Fields, on Contact object)
 
