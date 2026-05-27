@@ -1,0 +1,8 @@
+node_modules/
+.env
+.env.local
+*.log
+debug_*.html
+debug_*.png
+failure*.png
+.DS_Store

@@ -1,0 +1,14 @@
+{
+  "name": "716-storage-overdue-sync",
+  "version": "1.0.0",
+  "description": "Scrapes past-due renters from 716 Self Storage and pushes them to Zapier → GHL",
+  "main": "sync.js",
+  "scripts": {
+    "start": "node sync.js",
+    "debug": "DEBUG_DUMP=1 node sync.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "puppeteer": "^23.6.0"
+  }
+}
