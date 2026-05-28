@@ -1,7 +1,7 @@
 // 📌 716 Storage Overdue Sync
 // Scrapes the Collections Report (past-due renters) from
 // https://716selfstorage.storageunitsoftware.com/reports/collections
-// and posts each one to a Zapier webhook → GHL
+// and posts each one to a Zapier webhook → GHL (location WPHXIsSaU2aQpYy8rwzK).
 //
 // Required env vars:
 //   EMAIL        - 716 Storage login email
@@ -165,28 +165,45 @@ function normalizePhone(raw) {
         const balance = balance_text.replace(/[^0-9.]/g, "");
 
         // --- Contact (col 2) ---
-        // Layout is something like:
-        //   "Phone: (716) 307-4066"
-        //   "Cell: (716) 244-7284"
-        //   "email@example.com"
-        // Any of those three lines may be missing.
+        // Phone/Cell are <a href="tel:..."> links, each preceded by a
+        //   <strong>Phone:</strong> or <strong>Cell:</strong> label.
+        // Email is an <a href="mailto:..."> link.
+        // Any combination of the three may be present (incl. email only).
         const contactCell = cells[2];
-        const contactText = contactCell.innerText;
 
-        const phoneMatch = contactText.match(/Phone:\s*([\d\s\-\(\)\.\+]+)/i);
-        const cellMatch = contactText.match(/Cell:\s*([\d\s\-\(\)\.\+]+)/i);
-        const phone = phoneMatch ? clean(phoneMatch[1]) : "";
-        const cell = cellMatch ? clean(cellMatch[1]) : "";
+        let phone = "";
+        let cell = "";
 
-        // Email — prefer mailto link if present, fall back to regex
+        // Match each <strong> label to the tel: link that follows it
+        const strongs = contactCell.querySelectorAll("strong");
+        for (const strong of strongs) {
+          const label = clean(strong.textContent).toLowerCase();
+          let el = strong.nextElementSibling;
+          while (
+            el &&
+            !(el.tagName === "A" && (el.getAttribute("href") || "").startsWith("tel:"))
+          ) {
+            el = el.nextElementSibling;
+          }
+          if (el) {
+            const num = el.getAttribute("href").replace(/^tel:/, "").trim();
+            if (label.includes("cell")) cell = num;
+            else if (label.includes("phone")) phone = num;
+          }
+        }
+
+        // Fallback: if labels didn't resolve, grab tel: links in order
+        if (!phone && !cell) {
+          const telLinks = contactCell.querySelectorAll('a[href^="tel:"]');
+          if (telLinks[0]) phone = telLinks[0].getAttribute("href").replace(/^tel:/, "").trim();
+          if (telLinks[1]) cell = telLinks[1].getAttribute("href").replace(/^tel:/, "").trim();
+        }
+
+        // Email from mailto: link
         const mailto = contactCell.querySelector('a[href^="mailto:"]');
-        let email = mailto
+        const email = mailto
           ? mailto.getAttribute("href").replace(/^mailto:/, "").trim()
           : "";
-        if (!email) {
-          const em = contactText.match(/[\w._%+-]+@[\w.-]+\.[A-Za-z]{2,}/);
-          email = em ? em[0] : "";
-        }
 
         // --- Rentals (col 3) — collect "Unit 1", "Unit 53", etc. ---
         const unitMatches = cells[3].innerText.match(/Unit\s+\S+/gi) || [];
@@ -236,11 +253,15 @@ function normalizePhone(raw) {
       const phoneE164 = normalizePhone(c.phone_raw);
       const primary_phone = cellE164 || phoneE164;
 
-      if (!primary_phone) {
+      // Only skip if there's NO way to reach them (no phone AND no email)
+      if (!primary_phone && !c.email) {
         skipped++;
-        console.log(`⏭️  Skipping ${c.full_name} — no valid phone (raw: phone="${c.phone_raw}" cell="${c.cell_raw}")`);
+        console.log(`⏭️  Skipping ${c.full_name} — no phone and no email`);
         continue;
       }
+
+      // Lets the GHL workflow branch: SMS if we have a number, else email-only
+      const contact_method = primary_phone ? "sms" : "email";
 
       const nameParts = c.full_name.split(/\s+/);
       const first_name = nameParts[0] || "";
@@ -256,6 +277,7 @@ function normalizePhone(raw) {
           full_name: c.full_name,
           first_name,
           last_name,
+          contact_method,              // "sms" if a number exists, else "email"
           phone: primary_phone,        // best textable number → map this to GHL Phone
           cell: cellE164,              // explicit cell (E.164)
           home_phone: phoneE164,       // explicit landline/home phone (E.164)
@@ -271,7 +293,7 @@ function normalizePhone(raw) {
         await axios.post(WEBHOOK_URL, payload, { timeout: 15000 });
         sent++;
         console.log(
-          `📤 Sent: ${c.full_name} | ${primary_phone} | ${c.rentals.join(",")} | ${c.days_overdue}d | $${c.balance}`
+          `📤 Sent: ${c.full_name} | ${primary_phone || c.email} (${contact_method}) | ${c.rentals.join(",")} | ${c.days_overdue}d | $${c.balance}`
         );
       } catch (err) {
         failed++;
