@@ -1,7 +1,7 @@
 // 📌 716 Storage Overdue Sync
 // Scrapes the Collections Report (past-due renters) from
 // https://716selfstorage.storageunitsoftware.com/reports/collections
-// and posts each one to a Zapier webhook → GHL (location WPHXIsSaU2aQpYy8rwzK).
+// and posts each one to a Zapier webhook → GHL
 //
 // Required env vars:
 //   EMAIL        - 716 Storage login email
@@ -87,59 +87,35 @@ function normalizePhone(raw) {
     console.log("🔐 Loading login page...");
     await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded" });
 
-    // --- Step 1: email ---
-    await page.waitForSelector(
-      'input[type="email"], input[name="email"], input[name="user[email]"], #email',
-      { timeout: 60000 }
-    );
-    const emailSel = (await page.$('input[type="email"]'))
-      ? 'input[type="email"]'
-      : (await page.$('input[name="email"]'))
-      ? 'input[name="email"]'
-      : (await page.$('input[name="user[email]"]'))
-      ? 'input[name="user[email]"]'
-      : "#email";
+    // Exact selectors from the 716 facility_login_form
+    const USERNAME_SEL = "#facility_login_form_username";
+    const PASSWORD_SEL = "#facility_login_form_password";
+    const CONTINUE_SEL = 'input[type="submit"][value="Continue"]';
+    const LOGIN_SEL    = 'input[type="submit"][value="Log in"]';
 
-    await page.type(emailSel, EMAIL, { delay: 30 });
-    console.log(`  → typed email into ${emailSel}`);
+    // --- Step 1: username (note: it's type="text", not type="email") ---
+    await page.waitForSelector(USERNAME_SEL, { timeout: 60000 });
+    await page.type(USERNAME_SEL, EMAIL, { delay: 30 });
+    console.log(`  → typed username into ${USERNAME_SEL}`);
 
-    // Click Continue (could trigger navigation OR a JS-rendered password view)
-    const continueClick = page.click(
-      'button[type="submit"], input[type="submit"]'
-    );
-
-    // Wait for the password field to show up — handles both navigation and DOM-update flows
-    await Promise.race([
+    // Click Continue → wait for navigation OR for the password field to appear
+    await Promise.all([
       page
-        .waitForSelector('input[type="password"], input[name="password"], #password', {
-          timeout: 30000,
-        })
-        .then(() => "password_field"),
-      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 }).then(() => "nav"),
-    ]).catch((e) => console.log("  ⚠️ continue-wait race ended:", e.message));
-
-    // Make sure the click resolved too
-    await continueClick.catch(() => {});
-    await sleep(500);
+        .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 })
+        .catch(() => {}),
+      page.click(CONTINUE_SEL),
+    ]);
 
     // --- Step 2: password ---
-    await page.waitForSelector('input[type="password"], input[name="password"], #password', {
-      timeout: 30000,
-    });
-    const passSel = (await page.$('input[type="password"]'))
-      ? 'input[type="password"]'
-      : (await page.$('input[name="password"]'))
-      ? 'input[name="password"]'
-      : "#password";
-
-    await page.type(passSel, PASSWORD, { delay: 30 });
-    console.log(`  → typed password into ${passSel}`);
+    await page.waitForSelector(PASSWORD_SEL, { timeout: 30000 });
+    await page.type(PASSWORD_SEL, PASSWORD, { delay: 30 });
+    console.log(`  → typed password into ${PASSWORD_SEL}`);
 
     await Promise.all([
       page
         .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 })
         .catch(() => {}),
-      page.click('button[type="submit"], input[type="submit"]'),
+      page.click(LOGIN_SEL),
     ]);
 
     console.log("✅ Login complete, current URL:", page.url());
