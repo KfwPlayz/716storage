@@ -302,6 +302,182 @@ function normalizePhone(raw) {
       await sleep(150); // be polite to Zapier
     }
 
+    // ============================================================
+    // 🔄 Diff & move: anyone with an opportunity in the "Overdue" stage
+    // who is NOT in the current scrape → they paid.
+    // Move opportunity to "Active" stage + remove the overdue_payment tag.
+    // ============================================================
+    const PIPELINE_ID = "hzhAEaDnrCdXc7Xpfjga";
+    const STAGE_OVERDUE = "836ed913-f009-4c06-b6b3-db50d002a567";
+    const STAGE_ACTIVE = "0dfb03da-7687-440b-a0be-6fa70f0a4529";
+    const STORAGE_CUSTOMER_FIELD_KEY = "storage_customer_id";
+    const GHL_PIT_TOKEN = process.env.GHL_PIT_TOKEN;
+    const DRY_RUN = process.env.DRY_RUN === "1";
+
+    if (!GHL_PIT_TOKEN) {
+      console.log("\n⚠️  GHL_PIT_TOKEN not set — skipping Overdue→Active diff step.");
+    } else {
+      console.log(`\n🔄 Overdue→Active diff${DRY_RUN ? " (DRY RUN — no changes will be made)" : ""}...`);
+
+      const ghl = axios.create({
+        baseURL: "https://services.leadconnectorhq.com",
+        headers: {
+          Authorization: `Bearer ${GHL_PIT_TOKEN}`,
+          Version: "2021-07-28",
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        timeout: 30000,
+      });
+
+      // Set of customer_ids currently overdue per the latest scrape (strings, for comparison)
+      const currentOverdueIds = new Set(
+        customers.map((c) => String(c.customer_id || "").trim()).filter(Boolean)
+      );
+      console.log(`  Scrape says ${currentOverdueIds.size} customers are currently overdue.`);
+
+      // Extracts storage_customer_id from a GHL customFields array (handles multiple shapes)
+      const extractStorageId = (customFields) => {
+        if (!Array.isArray(customFields)) return "";
+        for (const cf of customFields) {
+          const key = (cf.key || cf.fieldKey || "").toLowerCase();
+          if (
+            key === STORAGE_CUSTOMER_FIELD_KEY ||
+            key.endsWith("." + STORAGE_CUSTOMER_FIELD_KEY)
+          ) {
+            const val =
+              cf.fieldValue ?? cf.value ?? cf.fieldValueString ?? cf.fieldValueArray?.[0] ?? "";
+            return String(val).trim();
+          }
+        }
+        return "";
+      };
+
+      // 1) Page through all opportunities in the Overdue stage
+      const overdueOpps = [];
+      let startAfter, startAfterId, pageNum = 1;
+      try {
+        while (true) {
+          const params = {
+            location_id: GHL_LOCATION_ID,
+            pipeline_id: PIPELINE_ID,
+            pipeline_stage_id: STAGE_OVERDUE,
+            limit: 100,
+          };
+          if (startAfter) params.startAfter = startAfter;
+          if (startAfterId) params.startAfterId = startAfterId;
+
+          const res = await ghl.get("/opportunities/search", { params });
+          const batch = res.data.opportunities || res.data.data || [];
+          overdueOpps.push(...batch);
+          console.log(`  Page ${pageNum}: fetched ${batch.length} opps (running total: ${overdueOpps.length})`);
+
+          const meta = res.data.meta || {};
+          if (batch.length < 100 || !meta.startAfter || !meta.startAfterId) break;
+          startAfter = meta.startAfter;
+          startAfterId = meta.startAfterId;
+          pageNum++;
+          await sleep(200);
+        }
+      } catch (err) {
+        const status = err.response?.status;
+        const body = err.response?.data;
+        console.error(
+          `  ❌ Failed to fetch Overdue opportunities: ${status || err.message}`,
+          body ? JSON.stringify(body) : ""
+        );
+        overdueOpps.length = 0;
+      }
+
+      console.log(`  GHL has ${overdueOpps.length} opportunit${overdueOpps.length === 1 ? "y" : "ies"} in the Overdue stage.`);
+
+      // 2) Resolve each opp's storage_customer_id (try opp customFields, fall back to contact)
+      const toMove = []; // { opportunityId, contactId, storageCustomerId, name }
+      for (const opp of overdueOpps) {
+        const oppId = opp.id;
+        const oppName = opp.name || opp.opportunityName || "(unnamed)";
+        const contactId = opp.contactId || opp.contact?.id || "";
+
+        let storageId = extractStorageId(opp.customFields);
+
+        if (!storageId && contactId) {
+          try {
+            const contactRes = await ghl.get(`/contacts/${contactId}`);
+            const contact = contactRes.data.contact || contactRes.data;
+            storageId = extractStorageId(contact.customFields);
+            await sleep(120);
+          } catch (err) {
+            console.log(`  ⚠️  Couldn't fetch contact ${contactId} for opp "${oppName}": ${err.message}`);
+          }
+        }
+
+        if (!storageId) {
+          console.log(`  ⏭️  Opp "${oppName}" (${oppId}) has no storage_customer_id — leaving alone.`);
+          continue;
+        }
+
+        if (currentOverdueIds.has(storageId)) {
+          // Still overdue, nothing to do
+          continue;
+        }
+
+        // Not in current scrape → they paid
+        toMove.push({ opportunityId: oppId, contactId, storageCustomerId: storageId, name: oppName });
+      }
+
+      console.log(`\n  💰 ${toMove.length} opp${toMove.length === 1 ? "" : "s"} appear to have paid (in GHL Overdue, not in scrape).`);
+
+      // 3) Execute the moves
+      let moved = 0, moveErrors = 0, tagsRemoved = 0, tagErrors = 0;
+      for (const item of toMove) {
+        console.log(`  → "${item.name}" (opp ${item.opportunityId}, customer_id ${item.storageCustomerId})`);
+        if (DRY_RUN) {
+          console.log(`     [DRY RUN] Would move to Active + remove overdue_payment tag.`);
+          continue;
+        }
+
+        // Move opportunity to Active stage
+        try {
+          await ghl.put(`/opportunities/${item.opportunityId}`, {
+            pipelineStageId: STAGE_ACTIVE,
+          });
+          moved++;
+          console.log(`     ✅ Moved opportunity to Active.`);
+        } catch (err) {
+          moveErrors++;
+          console.error(
+            `     ❌ Failed to move opp: ${err.response?.status || err.message}`,
+            err.response?.data ? JSON.stringify(err.response.data) : ""
+          );
+        }
+
+        // Remove overdue_payment tag from the contact
+        if (item.contactId) {
+          try {
+            await ghl.delete(`/contacts/${item.contactId}/tags`, {
+              data: { tags: ["overdue_payment"] },
+            });
+            tagsRemoved++;
+            console.log(`     ✅ Removed overdue_payment tag from contact.`);
+          } catch (err) {
+            tagErrors++;
+            console.error(
+              `     ❌ Failed to remove tag: ${err.response?.status || err.message}`,
+              err.response?.data ? JSON.stringify(err.response.data) : ""
+            );
+          }
+        }
+
+        await sleep(200);
+      }
+
+      console.log(
+        `\n  Diff summary: moved ${moved}/${toMove.length} opportunities, removed ${tagsRemoved} tags` +
+          (moveErrors || tagErrors ? `, ${moveErrors} move errors, ${tagErrors} tag errors` : "") +
+          (DRY_RUN ? " (DRY RUN — no actual changes made)" : "")
+      );
+    }
+
     console.log(`\n✅ Done. Sent: ${sent} | Failed: ${failed} | Skipped (no phone): ${skipped}`);
   } catch (err) {
     console.error("❌ Script Error:", err);
