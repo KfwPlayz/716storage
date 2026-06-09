@@ -11,6 +11,10 @@ on:
         description: "Run in debug-dump mode (dumps HTML + screenshot, no Zapier calls)"
         type: boolean
         default: false
+      dry_run:
+        description: "Dry run: do the diff but skip the actual GHL Overdue→Active moves"
+        type: boolean
+        default: false
 
 jobs:
   sync:
@@ -40,8 +44,10 @@ jobs:
           EMAIL: ${{ secrets.STORAGE_EMAIL }}
           PASSWORD: ${{ secrets.STORAGE_PASSWORD }}
           WEBHOOK_URL: ${{ secrets.ZAPIER_WEBHOOK_URL }}
+          GHL_PIT_TOKEN: ${{ secrets.GHL_PIT_TOKEN }}
           PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
           DEBUG_DUMP: ${{ inputs.debug_dump == true && '1' || '' }}
+          DRY_RUN: ${{ inputs.dry_run == true && '1' || '' }}
         run: node sync.js
 
       - name: Upload debug artifacts on failure
