@@ -334,14 +334,18 @@ function normalizePhone(raw) {
     // ============================================================
     if (!ghl) {
       console.log("\n⚠️  GHL_PIT_TOKEN not set — skipping opportunity upsert.");
-    } else if (sent === 0) {
-      console.log("\n⏭️  No customers sent to Zapier — skipping opportunity upsert.");
+    } else if (customers.length === 0) {
+      console.log("\n⏭️  No customers scraped — skipping opportunity upsert.");
     } else {
       const ZAPIER_WAIT_S = parseInt(process.env.ZAPIER_PROPAGATION_WAIT_SECONDS || "30", 10);
-      console.log(`\n⏳ Waiting ${ZAPIER_WAIT_S}s for Zapier to finish creating/updating contacts in GHL...`);
-      await sleep(ZAPIER_WAIT_S * 1000);
+      if (sent > 0) {
+        console.log(`\n⏳ Waiting ${ZAPIER_WAIT_S}s for Zapier to finish creating/updating contacts in GHL...`);
+        await sleep(ZAPIER_WAIT_S * 1000);
+      } else {
+        console.log(`\n⏭️  No successful Zapier sends — skipping wait, will attempt opp upsert on existing GHL contacts only.`);
+      }
 
-      console.log(`\n🎯 Upserting opportunities for ${sent} customer(s)${DRY_RUN ? " (DRY RUN)" : ""}...`);
+      console.log(`\n🎯 Upserting opportunities for ${customers.length} customer(s)${DRY_RUN ? " (DRY RUN)" : ""}...`);
 
       // Find a contact via GHL's duplicate-detect endpoint, with retry/backoff
       async function findContact(primaryPhone, email, fullName) {
