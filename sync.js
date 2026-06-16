@@ -303,9 +303,7 @@ function normalizePhone(raw) {
     }
 
     // ============================================================
-    // 🔄 Diff & move: anyone with an opportunity in the "Overdue" stage
-    // who is NOT in the current scrape → they paid.
-    // Move opportunity to "Active" stage + remove the overdue_payment tag.
+    // GHL API setup — shared by opp upsert (below) and diff/move (further below)
     // ============================================================
     const PIPELINE_ID = "hzhAEaDnrCdXc7Xpfjga";
     const STAGE_OVERDUE = "836ed913-f009-4c06-b6b3-db50d002a567";
@@ -314,12 +312,9 @@ function normalizePhone(raw) {
     const GHL_PIT_TOKEN = process.env.GHL_PIT_TOKEN;
     const DRY_RUN = process.env.DRY_RUN === "1";
 
-    if (!GHL_PIT_TOKEN) {
-      console.log("\n⚠️  GHL_PIT_TOKEN not set — skipping Overdue→Active diff step.");
-    } else {
-      console.log(`\n🔄 Overdue→Active diff${DRY_RUN ? " (DRY RUN — no changes will be made)" : ""}...`);
-
-      const ghl = axios.create({
+    let ghl = null;
+    if (GHL_PIT_TOKEN) {
+      ghl = axios.create({
         baseURL: "https://services.leadconnectorhq.com",
         headers: {
           Authorization: `Bearer ${GHL_PIT_TOKEN}`,
@@ -329,6 +324,156 @@ function normalizePhone(raw) {
         },
         timeout: 30000,
       });
+    }
+
+    // ============================================================
+    // 🎯 Upsert opportunities for each overdue customer.
+    // Zapier handles the contact upsert; this finds that contact in GHL
+    // and either creates a new Overdue opportunity or updates the existing one
+    // (forcing the stage back to Overdue if they were previously marked Active).
+    // ============================================================
+    if (!ghl) {
+      console.log("\n⚠️  GHL_PIT_TOKEN not set — skipping opportunity upsert.");
+    } else if (sent === 0) {
+      console.log("\n⏭️  No customers sent to Zapier — skipping opportunity upsert.");
+    } else {
+      const ZAPIER_WAIT_S = parseInt(process.env.ZAPIER_PROPAGATION_WAIT_SECONDS || "30", 10);
+      console.log(`\n⏳ Waiting ${ZAPIER_WAIT_S}s for Zapier to finish creating/updating contacts in GHL...`);
+      await sleep(ZAPIER_WAIT_S * 1000);
+
+      console.log(`\n🎯 Upserting opportunities for ${sent} customer(s)${DRY_RUN ? " (DRY RUN)" : ""}...`);
+
+      // Find a contact via GHL's duplicate-detect endpoint, with retry/backoff
+      async function findContact(primaryPhone, email, fullName) {
+        const maxAttempts = 3;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          if (primaryPhone) {
+            try {
+              const res = await ghl.get("/contacts/search/duplicate", {
+                params: { locationId: GHL_LOCATION_ID, number: primaryPhone },
+              });
+              if (res.data?.contact) return res.data.contact;
+            } catch (err) { /* try email next */ }
+          }
+          if (email) {
+            try {
+              const res = await ghl.get("/contacts/search/duplicate", {
+                params: { locationId: GHL_LOCATION_ID, email },
+              });
+              if (res.data?.contact) return res.data.contact;
+            } catch (err) { /* try retry */ }
+          }
+          if (attempt < maxAttempts) {
+            const wait = attempt * 5000;
+            console.log(`     ${fullName}: contact not found yet, waiting ${wait/1000}s before retry ${attempt + 1}/${maxAttempts}...`);
+            await sleep(wait);
+          }
+        }
+        return null;
+      }
+
+      let oppsCreated = 0, oppsUpdated = 0, oppsErrored = 0, contactsMissing = 0;
+
+      for (const c of customers) {
+        const cellE164 = normalizePhone(c.cell_raw);
+        const phoneE164 = normalizePhone(c.phone_raw);
+        const primary_phone = cellE164 || phoneE164;
+        if (!primary_phone && !c.email) continue; // matches the Zapier send skip rule
+
+        // 1) Find the GHL contact (Zapier should have created/updated it by now)
+        const contact = await findContact(primary_phone, c.email, c.full_name);
+        if (!contact) {
+          contactsMissing++;
+          console.log(`  ⚠️  ${c.full_name}: GHL contact not found — skipping opp upsert (Zapier may still be processing)`);
+          continue;
+        }
+        const contactId = contact.id;
+
+        // 2) Look for an existing opportunity for this contact in the Collections pipeline
+        let existingOpp = null;
+        try {
+          const res = await ghl.get("/opportunities/search", {
+            params: {
+              location_id: GHL_LOCATION_ID,
+              pipeline_id: PIPELINE_ID,
+              contact_id: contactId,
+              limit: 10,
+            },
+          });
+          const opps = res.data?.opportunities || res.data?.data || [];
+          existingOpp = opps[0] || null;
+        } catch (err) {
+          oppsErrored++;
+          console.error(`  ❌ ${c.full_name}: opp search failed (${err.response?.status || err.message})`);
+          continue;
+        }
+
+        const balanceNum = parseFloat(c.balance) || 0;
+        const customFields = [
+          { key: STORAGE_CUSTOMER_FIELD_KEY, field_value: String(c.customer_id || "") },
+        ];
+
+        if (DRY_RUN) {
+          console.log(`  [DRY RUN] ${c.full_name}: would ${existingOpp ? `update opp ${existingOpp.id} (force Overdue, $${balanceNum})` : `create new Overdue opp ($${balanceNum})`}`);
+          if (existingOpp) oppsUpdated++; else oppsCreated++;
+          continue;
+        }
+
+        if (existingOpp) {
+          // Update — force back to Overdue (handles re-overdue case), update value + custom field
+          try {
+            await ghl.put(`/opportunities/${existingOpp.id}`, {
+              pipelineStageId: STAGE_OVERDUE,
+              monetaryValue: balanceNum,
+              status: "open",
+              name: c.full_name,
+              customFields,
+            });
+            oppsUpdated++;
+            console.log(`  ↻ ${c.full_name}: updated opp ${existingOpp.id} (Overdue, $${balanceNum})`);
+          } catch (err) {
+            oppsErrored++;
+            console.error(`  ❌ ${c.full_name}: opp update failed (${err.response?.status || err.message})`, err.response?.data ? JSON.stringify(err.response.data) : "");
+          }
+        } else {
+          // Create new opp in the Overdue stage
+          try {
+            await ghl.post("/opportunities/", {
+              locationId: GHL_LOCATION_ID,
+              pipelineId: PIPELINE_ID,
+              pipelineStageId: STAGE_OVERDUE,
+              contactId,
+              name: c.full_name,
+              monetaryValue: balanceNum,
+              status: "open",
+              customFields,
+            });
+            oppsCreated++;
+            console.log(`  ✨ ${c.full_name}: created new Overdue opp ($${balanceNum})`);
+          } catch (err) {
+            oppsErrored++;
+            console.error(`  ❌ ${c.full_name}: opp create failed (${err.response?.status || err.message})`, err.response?.data ? JSON.stringify(err.response.data) : "");
+          }
+        }
+
+        await sleep(200);
+      }
+
+      console.log(
+        `\n  Opp upsert summary: ${oppsCreated} created, ${oppsUpdated} updated, ${oppsErrored} errors, ${contactsMissing} contacts missing` +
+        (DRY_RUN ? " (DRY RUN — no actual changes made)" : "")
+      );
+    }
+
+    // ============================================================
+    // 🔄 Diff & move: anyone with an opportunity in the "Overdue" stage
+    // who is NOT in the current scrape → they paid.
+    // Move opportunity to "Active" stage + remove the overdue_payment tag.
+    // ============================================================
+    if (!ghl) {
+      console.log("\n⚠️  GHL_PIT_TOKEN not set — skipping Overdue→Active diff step.");
+    } else {
+      console.log(`\n🔄 Overdue→Active diff${DRY_RUN ? " (DRY RUN — no changes will be made)" : ""}...`);
 
       // Set of customer_ids currently overdue per the latest scrape (strings, for comparison)
       const currentOverdueIds = new Set(
