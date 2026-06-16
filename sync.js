@@ -483,7 +483,18 @@ function normalizePhone(raw) {
       const currentOverdueIds = new Set(
         customers.map((c) => String(c.customer_id || "").trim()).filter(Boolean)
       );
-      console.log(`  Scrape says ${currentOverdueIds.size} customers are currently overdue.`);
+
+      // Fallback match sets: phone (E.164) and email (lowercased), for legacy opps
+      // that don't yet have a storage_customer_id set.
+      const currentOverduePhones = new Set();
+      const currentOverdueEmails = new Set();
+      for (const c of customers) {
+        const phone = normalizePhone(c.cell_raw) || normalizePhone(c.phone_raw);
+        if (phone) currentOverduePhones.add(phone);
+        if (c.email) currentOverdueEmails.add(c.email.toLowerCase().trim());
+      }
+
+      console.log(`  Scrape says ${currentOverdueIds.size} customers are currently overdue (plus ${currentOverduePhones.size} phones / ${currentOverdueEmails.size} emails for fallback matching).`);
 
       // Extracts storage_customer_id from a GHL customFields array (handles multiple shapes)
       const extractStorageId = (customFields) => {
@@ -540,19 +551,21 @@ function normalizePhone(raw) {
 
       console.log(`  GHL has ${overdueOpps.length} opportunit${overdueOpps.length === 1 ? "y" : "ies"} in the Overdue stage.`);
 
-      // 2) Resolve each opp's storage_customer_id (try opp customFields, fall back to contact)
-      const toMove = []; // { opportunityId, contactId, storageCustomerId, name }
+      // 2) Determine which opps have paid — try storage_customer_id first, then fall back to phone/email
+      const toMove = []; // { opportunityId, contactId, storageCustomerId, matchedVia, name }
       for (const opp of overdueOpps) {
         const oppId = opp.id;
         const oppName = opp.name || opp.opportunityName || "(unnamed)";
         const contactId = opp.contactId || opp.contact?.id || "";
 
         let storageId = extractStorageId(opp.customFields);
+        let contact = null; // hold the contact obj if we fetch it (avoid double-fetching)
 
+        // Fall back to contact's custom fields for storage_customer_id
         if (!storageId && contactId) {
           try {
             const contactRes = await ghl.get(`/contacts/${contactId}`);
-            const contact = contactRes.data.contact || contactRes.data;
+            contact = contactRes.data.contact || contactRes.data;
             storageId = extractStorageId(contact.customFields);
             await sleep(120);
           } catch (err) {
@@ -560,18 +573,44 @@ function normalizePhone(raw) {
           }
         }
 
-        if (!storageId) {
-          console.log(`  ⏭️  Opp "${oppName}" (${oppId}) has no storage_customer_id — leaving alone.`);
+        // Fast path: matched by storage_customer_id
+        if (storageId) {
+          if (currentOverdueIds.has(storageId)) continue; // still overdue
+          toMove.push({ opportunityId: oppId, contactId, storageCustomerId: storageId, matchedVia: "storage_customer_id", name: oppName });
           continue;
         }
 
-        if (currentOverdueIds.has(storageId)) {
-          // Still overdue, nothing to do
+        // No storage_customer_id anywhere — fall back to contact phone/email matching.
+        // (Lets us correctly identify "paid" customers whose opps predate the storage_customer_id field.)
+        if (!contact && contactId) {
+          try {
+            const contactRes = await ghl.get(`/contacts/${contactId}`);
+            contact = contactRes.data.contact || contactRes.data;
+            await sleep(120);
+          } catch (err) {
+            console.log(`  ⚠️  Couldn't fetch contact ${contactId} for fallback match on opp "${oppName}": ${err.message}`);
+          }
+        }
+
+        if (!contact) {
+          console.log(`  ⏭️  Opp "${oppName}" (${oppId}) has no storage_customer_id and contact unavailable — leaving alone.`);
           continue;
         }
 
-        // Not in current scrape → they paid
-        toMove.push({ opportunityId: oppId, contactId, storageCustomerId: storageId, name: oppName });
+        const contactPhone = normalizePhone(contact.phone);
+        const contactEmail = (contact.email || "").toLowerCase().trim();
+        const phoneInScrape = contactPhone && currentOverduePhones.has(contactPhone);
+        const emailInScrape = contactEmail && currentOverdueEmails.has(contactEmail);
+
+        if (phoneInScrape || emailInScrape) {
+          // Still overdue — matched by phone/email
+          console.log(`  ✓ Opp "${oppName}" still overdue (matched by ${phoneInScrape ? "phone" : "email"}; no storage_customer_id yet).`);
+          continue;
+        }
+
+        // No storage_customer_id, no phone/email match → they paid
+        console.log(`  💰 Opp "${oppName}" — no storage_customer_id, contact (phone: ${contactPhone || "none"}, email: ${contactEmail || "none"}) not in current scrape → paid.`);
+        toMove.push({ opportunityId: oppId, contactId, storageCustomerId: "(legacy/none)", matchedVia: "phone+email mismatch", name: oppName });
       }
 
       console.log(`\n  💰 ${toMove.length} opp${toMove.length === 1 ? "" : "s"} appear to have paid (in GHL Overdue, not in scrape).`);
